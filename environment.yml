@@ -1,0 +1,14 @@
+name: datasheet-interpeter
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pdfplumber
+  - langchain
+  - sentence-transformers
+  - faiss-cpu
+  - transformers
+  - pytorch
+  - pip:
+    - langchain-community
