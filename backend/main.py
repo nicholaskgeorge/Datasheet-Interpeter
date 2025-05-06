@@ -2,13 +2,21 @@ from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tempfile
-from PyPDF2 import PdfReader
+from PyPDF2 import PdfReader  # fallback if needed
+from langchain.document_loaders import PyPDFLoader
 from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
 import os
 import torch
 from huggingface_hub import login, InferenceApi
 import requests
 import traceback  # for detailed error logs
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.embeddings import SentenceTransformerEmbeddings
+from langchain.vectorstores import Qdrant
+from qdrant_client import QdrantClient
+from pdf2image import convert_from_path
+from PIL import Image
+import re  # for question pattern matching
 
 app = FastAPI()
 app.add_middleware(
@@ -52,6 +60,19 @@ if HF_TOKEN:
 else:
     print("[startup] no HF_TOKEN: inference_llama None")
 
+## Initialize Flan-T5-Small pipeline locally for fast inference
+small_pipeline = None
+try:
+    small_pipeline = pipeline(
+        'text2text-generation',
+        model='google/flan-t5-small',
+        device_map='auto'
+    )
+    print("[startup] small_pipeline created for google/flan-t5-small")
+except Exception as e:
+    print(f"[startup] small_pipeline init failed: {e}")
+    small_pipeline = None
+
 # Initialize HuggingFace question-answering pipeline
 qa_pipeline = pipeline('question-answering', model='distilbert-base-cased-distilled-squad')
 
@@ -73,6 +94,24 @@ except Exception as e:
     print(traceback.format_exc())
     llama_pipeline = None
 
+# Initialize Visual QA pipeline (BLIP/Vilt)
+vqa_pipeline = None
+try:
+    vqa_pipeline = pipeline(
+        "visual-question-answering",
+        model="dandelin/vilt-b32-finetuned-vqa",
+        device_map="auto"
+    )
+    print("[startup] vqa_pipeline created for dandelin/vilt-b32-finetuned-vqa")
+except Exception as e:
+    vqa_pipeline = None
+    print(f"[startup] vqa_pipeline init failed: {e}")
+
+# Initialize RAG components
+embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+qdrant_client = QdrantClient(url="localhost", prefer_grpc=True)
+vectordb = None
+
 @app.post("/upload_pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
     global pdf_path
@@ -80,6 +119,24 @@ async def upload_pdf(file: UploadFile = File(...)):
         tmp.write(await file.read())
         pdf_path = tmp.name
     return {"status": "success", "pdf_path": pdf_path}
+
+@app.post("/index_pdf/")
+async def index_pdf():
+    global vectordb
+    if not pdf_path:
+        return JSONResponse({"error": "No PDF uploaded."}, status_code=400)
+    loader = PyPDFLoader(pdf_path)
+    docs = loader.load()
+    splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    split_docs = splitter.split_documents(docs)
+    vectordb = Qdrant.from_documents(
+        split_docs,
+        embeddings,
+        url="http://localhost:6333",
+        prefer_grpc=True,
+        collection_name="datasheet"
+    )
+    return {"status": "indexed", "n_chunks": len(split_docs)}
 
 @app.post("/ask")
 @app.post("/ask/")
@@ -92,38 +149,51 @@ async def ask_question(
     print(f"[ask_question] llama_pipeline available: {llama_pipeline is not None}, inference_llama available: {inference_llama is not None}")
     if not pdf_path:
         return JSONResponse({"answer": "No PDF uploaded."}, status_code=400)
-    # Extract text from PDF
-    reader = PdfReader(pdf_path)
-    # Extract full text from PDF
-    full_text = ""
-    for page in reader.pages:
-        full_text += page.extract_text() or ""
-    # Branch based on model selection
-    if model == "distilbert":
-        prompt_question = f"{SYSTEM_PROMPT}\n{question}"
+    # Simple fallback for device name queries
+    if re.search(r"name of.*device|device name|model number|part number", question, re.I):
         try:
-            result = qa_pipeline(question=prompt_question, context=full_text)
-            answer = result.get("answer", "Could not find an answer.")
+            reader = PdfReader(pdf_path)
+            text0 = reader.pages[0].extract_text() or ""
+            for line in text0.splitlines():
+                if re.search(r"[A-Za-z]+\d+", line):
+                    return JSONResponse({"answer": line.strip()})
         except Exception as e:
-            answer = f"Error during QA: {str(e)}"
-    elif model == "llama":
-        # Truncate context to avoid large payloads
-        max_chars = 2000
-        llama_context = full_text if len(full_text) <= max_chars else full_text[:max_chars]
-        prompt = f"{SYSTEM_PROMPT}\nContext:\n{llama_context}\n\nQuestion: {question}\nAnswer:"
-        if not llama_pipeline:
-            answer = "LLaMA pipeline not available."
-        else:
-            try:
-                outputs = llama_pipeline(prompt, max_new_tokens=128)
-                gen_text = outputs[0].get("generated_text", "")
-                answer = gen_text.split("Answer:")[-1].strip()
-            except Exception as e:
-                answer = f"Error during LLaMA generation: {e}"
-    elif model == "visual":
-        answer = "Visual QA is not yet implemented."
+            print(f"[ask_question] device name fallback failed: {e}")
+    # RAG context retrieval
+    if vectordb:
+        retrieved_docs = vectordb.similarity_search(question, k=5)
+        print(f"[ask_question] Retrieved {len(retrieved_docs)} chunks from vector store")
+        full_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
     else:
-        answer = "Unknown model."
+        loader = PyPDFLoader(pdf_path)
+        docs = loader.load()
+        print(f"[ask_question] LangChain loader returned {len(docs)} docs")
+        full_text = ""
+        for idx, doc in enumerate(docs):
+            page_content = doc.page_content or ""
+            print(f"[ask_question] doc {idx+1}/{len(docs)} snippet: {page_content[:200]!r}")
+            full_text += page_content
+    print(f"[ask_question] context length={len(full_text)}")
+    print(f"[ask_question] context snippet: {full_text[:500]!r}")
+    # Unified QA: combine text (RAG) and visual QA, auto-select by confidence
+    try:
+        res_t = qa_pipeline(question=question, context=full_text)
+        text_answer = res_t.get("answer", "")
+        text_score = res_t.get("score", 0.0)
+    except Exception:
+        text_answer, text_score = "", 0.0
+    best_visual_answer, best_visual_score = "", -1.0
+    if vqa_pipeline:
+        try:
+            pages = convert_from_path(pdf_path)
+            for page in pages:
+                res_v = vqa_pipeline({"image": page, "question": question})
+                if res_v and res_v[0].get("score", 0) > best_visual_score:
+                    best_visual_score = res_v[0]["score"]
+                    best_visual_answer = res_v[0].get("answer", "")
+        except Exception:
+            pass
+    answer = best_visual_answer if best_visual_score > text_score else text_answer
     # Fallback if answer is empty
     if not answer.strip():
         answer = "No answer found."

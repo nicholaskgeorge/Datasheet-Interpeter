@@ -4,3 +4,8 @@ python-multipart
 PyPDF2
 transformers
 torch
+langchain
+sentence-transformers
+qdrant-client
+pdf2image
+pillow
