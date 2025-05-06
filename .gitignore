@@ -1,0 +1,14 @@
+# Ignore Python virtual environments
+venv/
+.venv/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Editor directories and files
+.vscode/
+.idea/
+
+# Environment variables file
+.env
