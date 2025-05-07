@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 import tempfile
 from PyPDF2 import PdfReader  # fallback if needed
 from langchain.document_loaders import PyPDFLoader
-from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
+from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer, LayoutLMv3Processor, LayoutLMv3ForQuestionAnswering
 import os
 import torch
 from huggingface_hub import login, InferenceApi
@@ -107,6 +107,23 @@ except Exception as e:
     vqa_pipeline = None
     print(f"[startup] vqa_pipeline init failed: {e}")
 
+## Initialize LayoutLMv3 pipeline for document QA
+layout_processor = None
+layout_pipeline = None
+try:
+    layout_processor = LayoutLMv3Processor.from_pretrained("microsoft/layoutlmv3-base")
+    layout_model = LayoutLMv3ForQuestionAnswering.from_pretrained("microsoft/layoutlmv3-base")
+    layout_pipeline = pipeline(
+        "document-question-answering",
+        model=layout_model,
+        processor=layout_processor,
+        device_map="auto"
+    )
+    print("[startup] layoutlmv3 pipeline created for microsoft/layoutlmv3-base")
+except Exception as e:
+    layout_pipeline = None
+    print(f"[startup] layoutlmv3 init failed: {e}")
+
 # Initialize RAG components
 embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 qdrant_client = QdrantClient(url="localhost", prefer_grpc=True)
@@ -149,6 +166,19 @@ async def ask_question(
     print(f"[ask_question] llama_pipeline available: {llama_pipeline is not None}, inference_llama available: {inference_llama is not None}")
     if not pdf_path:
         return JSONResponse({"answer": "No PDF uploaded."}, status_code=400)
+    # Try LayoutLMv3 for unified document QA
+    if layout_pipeline:
+        try:
+            pages = convert_from_path(pdf_path)
+            best_answer, best_score = "", -1.0
+            for page in pages:
+                res = layout_pipeline({"image": page, "question": question})
+                if res and res[0].get("score", 0) > best_score:
+                    best_score = res[0]["score"]
+                    best_answer = res[0].get("answer", "")
+            return JSONResponse({"answer": best_answer or "No answer found."})
+        except Exception as e:
+            print(f"[ask_question] layoutlmv3 error: {e}")
     # Simple fallback for device name queries
     if re.search(r"name of.*device|device name|model number|part number", question, re.I):
         try:
