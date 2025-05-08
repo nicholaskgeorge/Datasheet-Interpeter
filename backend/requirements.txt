@@ -5,7 +5,8 @@ PyPDF2
 transformers
 torch
 langchain
+langchain-community
 sentence-transformers
-qdrant-client
+faiss-cpu
 pdf2image
 pillow

@@ -2,18 +2,17 @@ from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tempfile
-from PyPDF2 import PdfReader  # fallback if needed
-from langchain.document_loaders import PyPDFLoader
+from PyPDF2 import PdfReader
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
 import os
 import torch
 from huggingface_hub import login, InferenceApi
 import requests
 import traceback  # for detailed error logs
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import SentenceTransformerEmbeddings
-from langchain.vectorstores import Qdrant
-from qdrant_client import QdrantClient
 from pdf2image import convert_from_path
 from PIL import Image
 import re  # for question pattern matching
@@ -22,7 +21,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -73,7 +72,7 @@ except Exception as e:
     print(f"[startup] small_pipeline init failed: {e}")
     small_pipeline = None
 
-# Initialize HuggingFace question-answering pipeline
+## Initialize HuggingFace question-answering pipeline
 qa_pipeline = pipeline('question-answering', model='distilbert-base-cased-distilled-squad')
 
 ## Initialize LLaMA pipeline with detailed logging
@@ -107,10 +106,20 @@ except Exception as e:
     vqa_pipeline = None
     print(f"[startup] vqa_pipeline init failed: {e}")
 
-# Initialize RAG components
-embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-qdrant_client = QdrantClient(url="localhost", prefer_grpc=True)
-vectordb = None
+## RAG vectorstore placeholder
+vectorstore = None
+def index_pdf(path: str):
+    global vectorstore
+    loader = PyPDFLoader(path)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+    # Use a text-only embedding model to avoid requiring bounding boxes
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    print(f"[startup] Indexed {len(chunks)} chunks from {path}")
 
 @app.post("/upload_pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -118,25 +127,9 @@ async def upload_pdf(file: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(await file.read())
         pdf_path = tmp.name
+    print(f"[upload_pdf] Saved PDF to {pdf_path}, starting RAG indexing")
+    index_pdf(pdf_path)
     return {"status": "success", "pdf_path": pdf_path}
-
-@app.post("/index_pdf/")
-async def index_pdf():
-    global vectordb
-    if not pdf_path:
-        return JSONResponse({"error": "No PDF uploaded."}, status_code=400)
-    loader = PyPDFLoader(pdf_path)
-    docs = loader.load()
-    splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    split_docs = splitter.split_documents(docs)
-    vectordb = Qdrant.from_documents(
-        split_docs,
-        embeddings,
-        url="http://localhost:6333",
-        prefer_grpc=True,
-        collection_name="datasheet"
-    )
-    return {"status": "indexed", "n_chunks": len(split_docs)}
 
 @app.post("/ask")
 @app.post("/ask/")
@@ -159,20 +152,11 @@ async def ask_question(
                     return JSONResponse({"answer": line.strip()})
         except Exception as e:
             print(f"[ask_question] device name fallback failed: {e}")
-    # RAG context retrieval
-    if vectordb:
-        retrieved_docs = vectordb.similarity_search(question, k=5)
-        print(f"[ask_question] Retrieved {len(retrieved_docs)} chunks from vector store")
-        full_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
-    else:
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
-        print(f"[ask_question] LangChain loader returned {len(docs)} docs")
-        full_text = ""
-        for idx, doc in enumerate(docs):
-            page_content = doc.page_content or ""
-            print(f"[ask_question] doc {idx+1}/{len(docs)} snippet: {page_content[:200]!r}")
-            full_text += page_content
+    # Fallback full document text via LangChain loader
+    loader = PyPDFLoader(pdf_path)
+    docs = loader.load()
+    print(f"[ask_question] LangChain loader returned {len(docs)} docs")
+    full_text = "\n\n".join(doc.page_content or "" for doc in docs)
     print(f"[ask_question] context length={len(full_text)}")
     print(f"[ask_question] context snippet: {full_text[:500]!r}")
     # Unified QA: combine text (RAG) and visual QA, auto-select by confidence
@@ -199,4 +183,44 @@ async def ask_question(
         answer = "No answer found."
     # Debug log
     print(f"[ask_question] model={model}, question={question}, answer={answer}")
+    if model == "distilbert":
+        pass
+    elif model == "small":
+        try:
+            outputs = small_pipeline(question, max_new_tokens=128)
+            answer = outputs[0].get('generated_text', '').strip()
+        except Exception as e:
+            answer = f"Error during small pipeline generation: {e}"
+    elif model == "rag":
+        # LayoutLM-based Retrieval-Augmented Generation
+        if vectorstore is None:
+            answer = "No RAG index available. Upload a PDF first."
+        else:
+            docs = vectorstore.similarity_search(question, k=5)
+            print(f"[ask_question] Retrieved {len(docs)} chunks for RAG")
+            context = "\n\n".join(doc.page_content or "" for doc in docs)
+            prompt = f"{SYSTEM_PROMPT}\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
+            print(f"[ask_question] RAG prompt snippet: {prompt[:500]!r}")
+            try:
+                outputs = small_pipeline(prompt, max_new_tokens=128)
+                answer = outputs[0].get('generated_text', '').strip()
+            except Exception as e:
+                answer = f"Error during RAG generation: {e}"
+    elif model == "llama":
+        if inference_llama:
+            try:
+                answer = inference_llama(
+                    inputs={"text": question, "max_new_tokens": 128},
+                    params={"return_full_text": False}
+                )["generated_text"]
+            except Exception as e:
+                answer = f"Error during LLaMA generation: {e}"
+        elif llama_pipeline:
+            try:
+                outputs = llama_pipeline(question, max_new_tokens=128)
+                answer = outputs[0].get('generated_text', '').strip()
+            except Exception as e:
+                answer = f"Error during LLaMA generation: {e}"
+        else:
+            answer = "LLaMA pipeline not available."
     return JSONResponse({"answer": answer})
